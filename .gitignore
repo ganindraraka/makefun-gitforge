@@ -2,3 +2,5 @@ SPEC/
 BUILD_TASK.md
 build*.log
 node_modules/
+REWRITE_TASK.md
+rewrite.log
