@@ -590,6 +590,7 @@ class Executor {
             issue.state = 'closed';
             issue.closedAt = Date.now();
             issue.updatedAt = Date.now();
+            issue.rev += 1;
             return { __type: 'CloseIssuePayload', issue: gqlIssue(repo, issue), clientMutationId: input.clientMutationId ?? null };
           }
           case 'updateIssue': {
@@ -601,6 +602,7 @@ class Executor {
               issue.closedAt = issue.state === 'closed' ? Date.now() : null;
             }
             issue.updatedAt = Date.now();
+            issue.rev += 1;
             return { __type: 'UpdateIssuePayload', issue: gqlIssue(repo, issue), clientMutationId: input.clientMutationId ?? null };
           }
           case 'createPullRequest': {

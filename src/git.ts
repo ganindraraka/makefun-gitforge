@@ -28,7 +28,13 @@ export function hashObject(type: GitObjectType, data: Buffer): string {
 }
 
 export function makeObject(type: GitObjectType, data: Buffer): GitObject {
-  return { type, data, deflated: deflateSync(data, { level: 1 }) };
+  const object = { type, data } as GitObject;
+  let deflated: Buffer | undefined;
+  Object.defineProperty(object, 'deflated', {
+    enumerable: true,
+    get: (): Buffer => (deflated ??= deflateSync(data, { level: 1 })),
+  });
+  return object;
 }
 
 const HEX40 = /^[0-9a-f]{40}$/;
@@ -338,6 +344,7 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
     baseOffset?: number;
     baseOid?: string;
     resolved?: GitObject;
+    oid?: string;
   }
   const raw: RawEntry[] = [];
   const byOffset = new Map<number, RawEntry>();
@@ -394,13 +401,14 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
     }
     const object = makeObject(type, data);
     entry.resolved = object;
-    byOid.set(hashObject(type, data), entry);
+    entry.oid = hashObject(type, data);
+    byOid.set(entry.oid, entry);
     resolving.delete(entry.offset);
     return object;
   };
   for (const entry of raw) {
     const object = resolve(entry);
-    const oid = hashObject(object.type, object.data);
+    const oid = entry.oid!;
     if (!objects.has(oid)) objects.set(oid, object);
   }
   return { objects, count: declaredCount };
@@ -488,8 +496,12 @@ export function collectReachable(roots: Iterable<string>, lookup: ObjectLookup, 
 /** Whether `ancestor` is reachable from `descendant` by parent links (equal counts as yes). */
 export function isAncestor(ancestor: string, descendant: string, lookup: ObjectLookup): boolean {
   if (ancestor === descendant) return true;
-  const seen = new Set<string>();
-  const queue = [descendant];
+  const tip = lookup(descendant);
+  if (!tip || tip.type !== 'commit') return false;
+  const parents = parseCommit(tip.data).parents;
+  if (parents.includes(ancestor)) return true;
+  const seen = new Set<string>([descendant]);
+  const queue = [...parents];
   while (queue.length) {
     const oid = queue.pop()!;
     if (oid === ancestor) return true;

@@ -9,6 +9,8 @@ import { parseCommit, parseTree, ZERO_OID } from './git.ts';
 export interface RestResult {
   status: number;
   json?: unknown;
+  /** Pre-serialized JSON body (trailing newline included); wins over `json`. */
+  body?: Buffer;
   headers?: Record<string, string>;
 }
 
@@ -22,12 +24,21 @@ export interface RestRequest {
   host: string;
 }
 
+let isoCacheMs = -1;
+let isoCacheText = '';
+
 function iso(ms: number | null): string | null {
-  return ms === null ? null : new Date(ms).toISOString();
+  if (ms === null) return null;
+  if (ms === isoCacheMs) return isoCacheText;
+  isoCacheMs = ms;
+  isoCacheText = new Date(ms).toISOString();
+  return isoCacheText;
 }
 
+let userJsonCache: Record<string, unknown> | undefined;
+
 export function userJson(): Record<string, unknown> {
-  return {
+  return (userJsonCache ??= {
     login: VIEWER.login,
     id: VIEWER.id,
     node_id: globalId('User', VIEWER.id),
@@ -39,7 +50,7 @@ export function userJson(): Record<string, unknown> {
     site_admin: false,
     name: VIEWER.name,
     email: VIEWER.email,
-  };
+  });
 }
 
 export function repoJson(forge: Forge, repo: Repo): Record<string, unknown> {
@@ -52,10 +63,10 @@ export function repoJson(forge: Forge, repo: Repo): Record<string, unknown> {
     full_name: repo.fullName,
     private: repo.private,
     owner: userJson(),
-    html_url: `http://localhost/${repo.fullName}`,
+    html_url: repo.htmlBase,
     description: repo.description,
     fork: false,
-    url: `/api/v3/repos/${repo.fullName}`,
+    url: repo.apiBase,
     created_at: iso(repo.createdAt),
     updated_at: iso(repo.updatedAt),
     pushed_at: iso(repo.updatedAt),
@@ -97,9 +108,9 @@ export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   return {
     id: issue.id,
     node_id: globalId('Issue', repo.id, issue.number),
-    url: `/api/v3/repos/${repo.fullName}/issues/${issue.number}`,
-    repository_url: `/api/v3/repos/${repo.fullName}`,
-    html_url: `http://localhost/${repo.fullName}/issues/${issue.number}`,
+    url: `${repo.apiBase}/issues/${issue.number}`,
+    repository_url: repo.apiBase,
+    html_url: `${repo.htmlBase}/issues/${issue.number}`,
     number: issue.number,
     state: issue.state,
     state_reason: issue.state === 'closed' ? 'completed' : null,
@@ -118,6 +129,39 @@ export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     updated_at: iso(issue.updatedAt),
     author_association: 'OWNER',
   };
+}
+
+const issueBodyCache = new WeakMap<Issue, { rev: number; body: Buffer }>();
+
+/** The exact bytes sendJson would produce for issueJson, cached until the issue mutates. */
+export function issueBody(repo: Repo, issue: Issue): Buffer {
+  const cached = issueBodyCache.get(issue);
+  if (cached !== undefined && cached.rev === issue.rev) return cached.body;
+  const body = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issueBodyCache.set(issue, { rev: issue.rev, body });
+  return body;
+}
+
+const REPOS_PREFIX = '/api/v3/repos/';
+
+/**
+ * Fast path for GET /api/v3/repos/{owner}/{repo}/issues/{number}. The caller guarantees the path
+ * carries no query, percent-encoding, dot segment or backslash. Returns undefined when the path is
+ * another route (or names no repository), so the generic router answers exactly as before.
+ */
+export function fastIssueBody(forge: Forge, path: string): Buffer | undefined {
+  const ownerEnd = path.indexOf('/', REPOS_PREFIX.length);
+  if (ownerEnd < 0) return undefined;
+  const repoEnd = path.indexOf('/', ownerEnd + 1);
+  if (repoEnd < 0) return undefined;
+  if (!path.startsWith('issues/', repoEnd + 1)) return undefined;
+  const numberText = path.slice(repoEnd + 8);
+  if (numberText.indexOf('/') >= 0) return undefined;
+  const repo = forge.getRepo(path.slice(REPOS_PREFIX.length, ownerEnd), path.slice(ownerEnd + 1, repoEnd));
+  if (repo === undefined) return undefined;
+  const number = Number.parseInt(numberText, 10);
+  if (!Number.isFinite(number)) throw new HttpError(404, 'Not Found');
+  return issueBody(repo, forge.requireIssue(repo, number));
 }
 
 function commentJson(repo: Repo, issue: Issue, comment: IssueComment): Record<string, unknown> {
@@ -594,7 +638,7 @@ function repoRoutes(forge: Forge, repo: Repo, rest: string[], request: RestReque
       }
       if (method === 'POST') {
         const issue = forge.createIssue(repo, body.title as string, body.body as string, listOfStrings(body.labels));
-        return { status: 201, json: issueJson(repo, issue), headers: { location: `${base}/issues/${issue.number}` } };
+        return { status: 201, body: issueBody(repo, issue), headers: { location: `${base}/issues/${issue.number}` } };
       }
     }
     if (rest.length >= 2) {
@@ -602,7 +646,7 @@ function repoRoutes(forge: Forge, repo: Repo, rest: string[], request: RestReque
       if (!Number.isFinite(number)) throw new HttpError(404, 'Not Found');
       const issue = forge.requireIssue(repo, number);
       if (rest.length === 2) {
-        if (method === 'GET') return { status: 200, json: issueJson(repo, issue) };
+        if (method === 'GET') return { status: 200, body: issueBody(repo, issue) };
         if (method === 'PATCH') {
           const now = Date.now();
           if (typeof body.title === 'string') issue.title = body.title;
@@ -624,6 +668,7 @@ function repoRoutes(forge: Forge, repo: Repo, rest: string[], request: RestReque
             issue.labels = attached;
           }
           issue.updatedAt = now;
+          issue.rev += 1;
           return { status: 200, json: issueJson(repo, issue) };
         }
       }

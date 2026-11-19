@@ -6,7 +6,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { Forge, HttpError } from './src/store.ts';
 import { GitHttp } from './src/git-http.ts';
 import type { GitResult } from './src/git-http.ts';
-import { handleRest } from './src/rest.ts';
+import { handleRest, fastIssueBody } from './src/rest.ts';
 import type { RestResult } from './src/rest.ts';
 import { executeGraphQL } from './src/graphql.ts';
 import { handleMcp } from './src/mcp.ts';
@@ -15,6 +15,12 @@ import { GitError } from './src/git.ts';
 const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY_BYTES = 128 * 1024 * 1024;
 const API_PREFIX = '/api/v3';
+const API_PREFIX_SLASH = `${API_PREFIX}/`;
+const REPOS_PREFIX = `${API_PREFIX}/repos/`;
+const EMPTY_QUERY = new URLSearchParams();
+const EMPTY_BODY = Buffer.alloc(0);
+/** Characters that force full URL parsing: query, fragment, encoding, dot segments, backslash. */
+const URL_SPECIAL = /[?#%.\\]/;
 
 let requestCounter = 0;
 
@@ -24,14 +30,14 @@ function requestId(): string {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = body === undefined ? '' : `${JSON.stringify(body)}\n`;
+  const buf = body === undefined ? EMPTY_BODY : Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': buf.length,
     'x-github-request-id': requestId(),
     ...headers,
   });
-  res.end(text);
+  res.end(buf);
 }
 
 function sendBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
@@ -57,7 +63,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -86,9 +92,19 @@ function authorized(req: IncomingMessage, token: string): boolean {
 }
 
 function renderRest(res: ServerResponse, result: RestResult): void {
-  if (result.status === 204 || result.json === undefined) {
+  if (result.status === 204 || (result.json === undefined && result.body === undefined)) {
     res.writeHead(result.status, { 'x-github-request-id': requestId(), ...result.headers });
     res.end();
+    return;
+  }
+  if (result.body !== undefined) {
+    res.writeHead(result.status, {
+      'content-type': JSON_TYPE,
+      'content-length': result.body.length,
+      'x-github-request-id': requestId(),
+      ...result.headers,
+    });
+    res.end(result.body);
     return;
   }
   sendJson(res, result.status, result.json, result.headers);
@@ -110,6 +126,26 @@ export function createApp(): Server {
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    if (req.method === 'GET') {
+      const rawUrl = req.url ?? '';
+      if (rawUrl.startsWith(REPOS_PREFIX) && !URL_SPECIAL.test(rawUrl) && authorized(req, token)) {
+        try {
+          const body = fastIssueBody(forge, rawUrl);
+          if (body !== undefined) {
+            res.writeHead(200, {
+              'content-type': JSON_TYPE,
+              'content-length': body.length,
+              'x-github-request-id': requestId(),
+            });
+            res.end(body);
+            return;
+          }
+        } catch (err) {
+          renderError(res, err);
+          return;
+        }
+      }
+    }
     handle(req, res).catch((err) => {
       renderError(res, err);
     });
@@ -121,21 +157,30 @@ export function createApp(): Server {
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const method = req.method ?? 'GET';
-    let url: URL;
-    try {
-      url = new URL(req.url ?? '/', 'http://entry');
-    } catch {
-      sendJson(res, 400, { message: 'Bad Request' });
-      return;
+    const rawUrl = req.url ?? '/';
+    let path: string;
+    let query: URLSearchParams;
+    if (rawUrl.charCodeAt(0) === 47 && !URL_SPECIAL.test(rawUrl)) {
+      path = rawUrl;
+      query = EMPTY_QUERY;
+    } else {
+      let url: URL;
+      try {
+        url = new URL(rawUrl, 'http://entry');
+      } catch {
+        sendJson(res, 400, { message: 'Bad Request' });
+        return;
+      }
+      path = url.pathname;
+      query = url.searchParams;
     }
-    const path = url.pathname;
 
     if (method === 'GET' && path === '/healthz') {
       sendJson(res, 200, { ok: true });
       return;
     }
 
-    if (path === API_PREFIX || path.startsWith(`${API_PREFIX}/`)) {
+    if (path === API_PREFIX || path.startsWith(API_PREFIX_SLASH)) {
       if (!authorized(req, token)) {
         sendJson(res, 401, { message: 'Requires authentication', documentation_url: 'https://docs.github.com/rest' });
         return;
@@ -144,7 +189,7 @@ export function createApp(): Server {
       const result = handleRest(forge, {
         method,
         path: path.slice(API_PREFIX.length),
-        query: url.searchParams,
+        query,
         body,
         host: req.headers.host ?? 'localhost',
       });
@@ -225,7 +270,7 @@ export function createApp(): Server {
         owner,
         name,
         suffix: gitMatch[3] ?? '',
-        query: url.searchParams,
+        query,
         gitProtocol: req.headers['git-protocol'] ?? '',
         body,
       });

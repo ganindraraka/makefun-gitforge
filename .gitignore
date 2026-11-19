@@ -4,3 +4,6 @@ build*.log
 node_modules/
 REWRITE_TASK.md
 rewrite.log
+OPTIMIZE_TASK.md
+opt.log
+perflogs/

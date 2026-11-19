@@ -57,6 +57,8 @@ export interface Issue {
   createdAt: number;
   updatedAt: number;
   closedAt: number | null;
+  /** Bumped on every mutation; invalidates the serialized-JSON cache. */
+  rev: number;
 }
 
 export interface Pull {
@@ -90,6 +92,9 @@ export class Repo {
   createdAt: number;
   updatedAt: number;
   refVersion = 0;
+  /** Invariant URL prefixes (owner/name never change after creation). */
+  readonly apiBase: string;
+  readonly htmlBase: string;
 
   constructor(id: number, owner: string, name: string, description: string, isPrivate: boolean) {
     this.id = id;
@@ -99,6 +104,8 @@ export class Repo {
     this.private = isPrivate;
     this.createdAt = Date.now();
     this.updatedAt = this.createdAt;
+    this.apiBase = `/api/v3/repos/${owner}/${name}`;
+    this.htmlBase = `http://localhost/${owner}/${name}`;
   }
 
   get fullName(): string {
@@ -178,8 +185,9 @@ export class Forge {
   }
 
   requireRepo(owner: string, name: string): Repo {
-    const repo = this.getRepo(owner, name);
-    if (!repo || repo.owner.toLowerCase() !== owner.toLowerCase()) throw new HttpError(404, 'Not Found');
+    const lower = owner.toLowerCase();
+    const repo = this.repos.get(`${lower}/${name.toLowerCase()}`);
+    if (!repo || repo.owner.toLowerCase() !== lower) throw new HttpError(404, 'Not Found');
     return repo;
   }
 
@@ -560,6 +568,7 @@ export class Forge {
       createdAt: now,
       updatedAt: now,
       closedAt: null,
+      rev: 0,
     };
     repo.issues.set(issue.number, issue);
     return issue;
@@ -577,6 +586,7 @@ export class Forge {
     const comment: IssueComment = { id: this.nextCommentId++, body, createdAt: now, updatedAt: now };
     issue.comments.push(comment);
     issue.updatedAt = now;
+    issue.rev += 1;
     return comment;
   }
 

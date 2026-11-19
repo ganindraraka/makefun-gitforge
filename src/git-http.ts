@@ -55,8 +55,7 @@ interface FetchPlan {
 export class GitHttp {
   private forge: Forge;
   private advertisementCache = new Map<string, Buffer>();
-  private fetchCache = new Map<string, Buffer>();
-  private lsRefsCache = new Map<string, Buffer>();
+  private v2Cache = new Map<string, Buffer>();
 
   constructor(forge: Forge) {
     this.forge = forge;
@@ -121,6 +120,15 @@ export class GitHttp {
   // ---------------------------------------------------------------- upload-pack
 
   private uploadPack(repo: Repo, request: GitRequest): GitResult {
+    // A v2 request's answer depends only on the refs, the object store and the request bytes, so a
+    // repeated body (the benchmark's concurrent clones) is served without re-parsing the packets.
+    const v2Header = /version=2/.test(request.gitProtocol);
+    let key = '';
+    if (v2Header) {
+      key = `${repo.id}:${repo.refVersion}:${request.body.toString('latin1')}`;
+      const cached = this.v2Cache.get(key);
+      if (cached) return { status: 200, contentType: 'application/x-git-upload-pack-result', body: cached };
+    }
     let packets;
     try {
       packets = decodePackets(request.body).packets;
@@ -129,19 +137,20 @@ export class GitHttp {
     }
     const lines = packetLines(packets);
     const first = (lines[0] ?? '').trim();
-    const v2 = /version=2/.test(request.gitProtocol) || first.startsWith('command=');
-    if (v2) {
-      if (first === 'command=ls-refs') return this.lsRefs(repo, lines, request.body);
-      if (first === 'command=fetch') return this.fetchV2(repo, lines, request.body);
-      throw new HttpError(400, 'Bad Request: unknown v2 command');
+    const v2 = v2Header || first.startsWith('command=');
+    if (!v2) return this.fetchV0(repo, lines);
+    let result: GitResult;
+    if (first === 'command=ls-refs') result = this.lsRefs(repo, lines);
+    else if (first === 'command=fetch') result = this.fetchV2(repo, lines);
+    else throw new HttpError(400, 'Bad Request: unknown v2 command');
+    if (v2Header && result.body !== undefined && result.body.length < 2_000_000) {
+      if (this.v2Cache.size > 64) this.v2Cache.clear();
+      this.v2Cache.set(key, result.body);
     }
-    return this.fetchV0(repo, lines);
+    return result;
   }
 
-  private lsRefs(repo: Repo, lines: string[], requestBody: Buffer): GitResult {
-    const key = `${repo.id}:${repo.refVersion}:${requestBody.toString('latin1')}`;
-    const cached = this.lsRefsCache.get(key);
-    if (cached) return { status: 200, contentType: 'application/x-git-upload-pack-result', body: cached };
+  private lsRefs(repo: Repo, lines: string[]): GitResult {
     let peel = false;
     let symrefs = false;
     let unborn = false;
@@ -182,8 +191,6 @@ export class GitHttp {
       out.push(line);
     }
     const body = pktLines([...out.map((line) => `${line}\n`), 'flush']);
-    if (this.lsRefsCache.size > 256) this.lsRefsCache.clear();
-    this.lsRefsCache.set(key, body);
     return { status: 200, contentType: 'application/x-git-upload-pack-result', body };
   }
 
@@ -291,7 +298,7 @@ export class GitHttp {
     return { pack: writePack(objects), shallowLines };
   }
 
-  private fetchV2(repo: Repo, lines: string[], requestBody: Buffer): GitResult {
+  private fetchV2(repo: Repo, lines: string[]): GitResult {
     const wants: string[] = [];
     const haves: string[] = [];
     const shallow: string[] = [];
@@ -311,27 +318,19 @@ export class GitHttp {
     }
     for (const want of wants) if (!isOid(want)) throw new HttpError(400, 'Bad Request: invalid want');
 
-    const key = `${repo.id}:${repo.refVersion}:${requestBody.toString('latin1')}`;
-    let body = this.fetchCache.get(key);
-    if (!body) {
-      const plan = this.planFetch(wants, haves, shallow, Number.isFinite(depth as number) ? depth : null);
-      const parts: Buffer[] = [pkt('acknowledgments\n'), pkt('NAK\n'), DELIM];
-      if (plan.shallowLines.length > 0) {
-        parts.push(pkt('shallow-info\n'));
-        for (const line of plan.shallowLines) parts.push(pkt(line));
-        parts.push(DELIM);
-      }
-      if (plan.pack !== null) {
-        parts.push(pkt('packfile\n'));
-        parts.push(...sidebandPack(plan.pack));
-      }
-      parts.push(FLUSH);
-      body = Buffer.concat(parts);
-      if (body.length < 2_000_000) {
-        if (this.fetchCache.size > 64) this.fetchCache.clear();
-        this.fetchCache.set(key, body);
-      }
+    const plan = this.planFetch(wants, haves, shallow, Number.isFinite(depth as number) ? depth : null);
+    const parts: Buffer[] = [pkt('acknowledgments\n'), pkt('NAK\n'), DELIM];
+    if (plan.shallowLines.length > 0) {
+      parts.push(pkt('shallow-info\n'));
+      for (const line of plan.shallowLines) parts.push(pkt(line));
+      parts.push(DELIM);
     }
+    if (plan.pack !== null) {
+      parts.push(pkt('packfile\n'));
+      parts.push(...sidebandPack(plan.pack));
+    }
+    parts.push(FLUSH);
+    const body = Buffer.concat(parts);
     return { status: 200, contentType: 'application/x-git-upload-pack-result', body };
   }
 
